@@ -1,0 +1,470 @@
+name: Codex agent command
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+  actions: read
+
+concurrency:
+  group: codex-agent-${{ github.repository }}-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+jobs:
+  codex:
+    if: |
+      startsWith(github.event.comment.body, '/codex-resolve') ||
+      startsWith(github.event.comment.body, '/codex-continue') ||
+      startsWith(github.event.comment.body, '/codex-fix-ci')
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Validate trigger permission
+        env:
+          AUTHOR_ASSOCIATION: ${{ github.event.comment.author_association }}
+        run: |
+          case "$AUTHOR_ASSOCIATION" in
+            OWNER|MEMBER|COLLABORATOR) ;;
+            *)
+              echo "Slash command author is not allowed: $AUTHOR_ASSOCIATION"
+              exit 1
+              ;;
+          esac
+
+      - name: Validate Codex secrets
+        run: |
+          test -n "${CODEX_BASE_URL}" || { echo "Missing CODEX_BASE_URL secret"; exit 1; }
+          test -n "${CODEX_SECRET_KEY}" || { echo "Missing CODEX_SECRET_KEY secret"; exit 1; }
+          test -n "${CODEX_MODEL}" || { echo "Missing CODEX_MODEL secret"; exit 1; }
+        env:
+          CODEX_BASE_URL: ${{ secrets.CODEX_BASE_URL }}
+          CODEX_SECRET_KEY: ${{ secrets.CODEX_SECRET_KEY }}
+          CODEX_MODEL: ${{ secrets.CODEX_MODEL }}
+
+      - name: Resolve command
+        id: command
+        env:
+          COMMENT: ${{ github.event.comment.body }}
+        run: |
+          command="$(printf '%s\n' "$COMMENT" | sed -n '1s/[[:space:]].*$//p')"
+          case "$command" in
+            /codex-resolve|/codex-continue|/codex-fix-ci) ;;
+            *) echo "Unsupported command: $command"; exit 1 ;;
+          esac
+          echo "name=${command#/}" >> "$GITHUB_OUTPUT"
+
+      - name: Check out default branch for prompt files
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          path: prompt-source
+
+      - name: Collect GitHub context
+        id: context
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          IS_PR: ${{ github.event.issue.pull_request && 'true' || 'false' }}
+          COMMAND: ${{ steps.command.outputs.name }}
+        run: |
+          mkdir -p context
+          gh issue view "$ISSUE_NUMBER" --json number,title,body,labels,comments,url > context/issue.json
+
+          if [ "$IS_PR" = "true" ]; then
+            pr_number="$ISSUE_NUMBER"
+          elif [ "$COMMAND" = "codex-resolve" ]; then
+            pr_number=""
+          else
+            pr_number="$(gh pr list \
+              --state open \
+              --json number,headRefName,body \
+              --jq "[.[] | select(.headRefName | startswith(\"codex/resolve-upstream-conflict-${ISSUE_NUMBER}-\"))][0].number // empty")"
+          fi
+
+          if [ -n "$pr_number" ]; then
+            gh pr view "$pr_number" --json number,title,body,headRefName,baseRefName,url,state,comments,labels > context/pr.json
+            echo "pr_number=$pr_number" >> "$GITHUB_OUTPUT"
+            echo "has_pr=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "pr_number=" >> "$GITHUB_OUTPUT"
+            echo "has_pr=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Validate command target
+        env:
+          COMMAND: ${{ steps.command.outputs.name }}
+          HAS_PR: ${{ steps.context.outputs.has_pr }}
+          IS_PR: ${{ github.event.issue.pull_request && 'true' || 'false' }}
+          LABELS_JSON: ${{ toJSON(github.event.issue.labels.*.name) }}
+        run: |
+          case "$COMMAND" in
+            codex-resolve)
+              if [ "$IS_PR" = "true" ]; then
+                echo "/codex-resolve must be used on a conflict issue, not a PR."
+                exit 1
+              fi
+              python3 - <<'PY'
+          import json, os, sys
+          labels = set(json.loads(os.environ["LABELS_JSON"]))
+          required = {"agent:merge-conflict", "upstream-sync"}
+          missing = required - labels
+          if missing:
+              print("Issue is missing required labels: " + ", ".join(sorted(missing)))
+              sys.exit(1)
+          PY
+              if [ "$HAS_PR" = "true" ]; then
+                echo "An open Codex PR already exists for this issue. Use /codex-continue."
+                exit 1
+              fi
+              ;;
+            codex-continue)
+              if [ "$HAS_PR" != "true" ]; then
+                echo "No open Codex PR found. Use /codex-resolve first."
+                exit 1
+              fi
+              ;;
+            codex-fix-ci)
+              if [ "$HAS_PR" != "true" ]; then
+                echo "/codex-fix-ci requires an open PR or an issue with an associated open Codex PR."
+                exit 1
+              fi
+              ;;
+          esac
+
+      - name: Enforce attempt limit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+        run: |
+          attempts="$(gh issue view "$ISSUE_NUMBER" \
+            --json comments \
+            --jq '[.comments[].body | select(contains("Codex attempt summary"))] | length')"
+          echo "Existing Codex attempts: $attempts"
+          if [ "$attempts" -ge 3 ]; then
+            gh label create agent:blocked --color b60205 --description "Agent is blocked and needs human input" || true
+            gh issue edit "$ISSUE_NUMBER" --add-label agent:blocked
+            gh issue comment "$ISSUE_NUMBER" --body "Codex attempt limit reached. Please add human guidance before running another command."
+            exit 1
+          fi
+
+      - name: Extract upstream metadata
+        if: steps.command.outputs.name == 'codex-resolve'
+        id: meta
+        env:
+          BODY_FILE: context/issue.json
+        run: |
+          python3 - <<'PY' > metadata.env
+          import json
+          from pathlib import Path
+          body = json.loads(Path("context/issue.json").read_text()).get("body") or ""
+          keys = ("upstream_repo", "upstream_branch", "target_branch", "upstream_sha")
+          data = {}
+          for line in body.splitlines():
+              for key in keys:
+                  prefix = key + ": "
+                  if line.startswith(prefix):
+                      data[key] = line[len(prefix):].strip()
+          missing = [key for key in keys[:3] if not data.get(key)]
+          if missing:
+              raise SystemExit("Missing metadata in issue body: " + ", ".join(missing))
+          for key, value in data.items():
+              print(f"{key}={value}")
+          PY
+          cat metadata.env >> "$GITHUB_OUTPUT"
+
+      - name: Checkout target branch
+        if: steps.command.outputs.name == 'codex-resolve'
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ steps.meta.outputs.target_branch }}
+          fetch-depth: 0
+          path: worktree
+          token: ${{ github.token }}
+
+      - name: Prepare new conflict branch
+        if: steps.command.outputs.name == 'codex-resolve'
+        id: branch_resolve
+        working-directory: worktree
+        run: |
+          branch="codex/resolve-upstream-conflict-${{ github.event.issue.number }}-${{ github.run_id }}"
+          echo "name=$branch" >> "$GITHUB_OUTPUT"
+
+          git config user.name "codex-conflict-resolver"
+          git config user.email "codex-conflict-resolver@users.noreply.github.com"
+          git remote add upstream "https://github.com/${{ steps.meta.outputs.upstream_repo }}.git" || true
+          git fetch upstream "${{ steps.meta.outputs.upstream_branch }}"
+          git fetch origin "${{ steps.meta.outputs.target_branch }}"
+          git checkout -B "$branch" "origin/${{ steps.meta.outputs.target_branch }}"
+
+          set +e
+          git merge --no-ff --no-edit "upstream/${{ steps.meta.outputs.upstream_branch }}"
+          status=$?
+          set -e
+
+          if [ "$status" -eq 0 ]; then
+            echo "had_conflict=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "had_conflict=true" >> "$GITHUB_OUTPUT"
+            git diff --name-only --diff-filter=U > ../context/conflict-files.txt
+          fi
+
+      - name: Extract PR branch
+        if: steps.command.outputs.name != 'codex-resolve'
+        id: pr_branch
+        run: |
+          branch="$(jq -r '.headRefName' context/pr.json)"
+          base="$(jq -r '.baseRefName' context/pr.json)"
+          echo "name=$branch" >> "$GITHUB_OUTPUT"
+          echo "base=$base" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout PR branch
+        if: steps.command.outputs.name != 'codex-resolve'
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ steps.pr_branch.outputs.name }}
+          fetch-depth: 0
+          path: worktree
+          token: ${{ github.token }}
+
+      - name: Configure PR branch git
+        if: steps.command.outputs.name != 'codex-resolve'
+        working-directory: worktree
+        run: |
+          git config user.name "codex-conflict-resolver"
+          git config user.email "codex-conflict-resolver@users.noreply.github.com"
+
+      - name: Collect PR diff and CI logs
+        if: steps.context.outputs.has_pr == 'true'
+        working-directory: worktree
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ steps.context.outputs.pr_number }}
+          HEAD_BRANCH: ${{ steps.pr_branch.outputs.name }}
+        run: |
+          git fetch origin "${{ steps.pr_branch.outputs.base }}"
+          git diff --stat "origin/${{ steps.pr_branch.outputs.base }}"...HEAD > ../context/pr-diff-stat.txt || true
+          git diff "origin/${{ steps.pr_branch.outputs.base }}"...HEAD > ../context/pr-diff.patch || true
+          gh pr checks "$PR_NUMBER" > ../context/pr-checks.txt || true
+          gh run list --branch "$HEAD_BRANCH" --limit 5 --json databaseId,name,conclusion,url,headBranch,headSha > ../context/ci-runs.json || true
+          run_id="$(jq -r '[.[] | select(.conclusion == "failure")][0].databaseId // empty' ../context/ci-runs.json)"
+          if [ -n "$run_id" ]; then
+            gh run view "$run_id" --log > ../context/ci-log.txt || true
+          fi
+
+      - name: Build Codex task prompt
+        env:
+          COMMAND: ${{ steps.command.outputs.name }}
+        run: |
+          case "$COMMAND" in
+            codex-resolve) prompt="resolve-upstream-conflict.md" ;;
+            codex-continue) prompt="continue-upstream-conflict.md" ;;
+            codex-fix-ci) prompt="fix-ci.md" ;;
+          esac
+
+          {
+            cat "prompt-source/.github/codex/prompts/$prompt"
+            printf '\n\n## Durable GitHub Context\n\n'
+            printf '### Issue\n\n```json\n'
+            cat context/issue.json
+            printf '\n```\n'
+            if [ -f context/pr.json ]; then
+              printf '\n### Pull Request\n\n```json\n'
+              cat context/pr.json
+              printf '\n```\n'
+            fi
+            if [ -f context/conflict-files.txt ]; then
+              printf '\n### Conflict Files\n\n```\n'
+              cat context/conflict-files.txt
+              printf '\n```\n'
+            fi
+            if [ -f context/pr-diff-stat.txt ]; then
+              printf '\n### PR Diff Stat\n\n```\n'
+              cat context/pr-diff-stat.txt
+              printf '\n```\n'
+            fi
+            if [ -f context/pr-checks.txt ]; then
+              printf '\n### PR Checks\n\n```\n'
+              cat context/pr-checks.txt
+              printf '\n```\n'
+            fi
+            if [ -f context/ci-log.txt ]; then
+              printf '\n### Latest Failing CI Log\n\n```\n'
+              tail -n 500 context/ci-log.txt
+              printf '\n```\n'
+            fi
+          } > context/codex-task.md
+
+      - name: Install Codex CLI
+        run: |
+          mkdir -p "$RUNNER_TEMP/codex-home" "$RUNNER_TEMP/bin"
+          curl -fsSL https://chatgpt.com/codex/install.sh \
+            | CODEX_NON_INTERACTIVE=1 CODEX_HOME="$RUNNER_TEMP/codex-home" CODEX_INSTALL_DIR="$RUNNER_TEMP/bin" sh
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+
+      - name: Configure Codex provider
+        env:
+          CODEX_HOME: ${{ runner.temp }}/codex-home
+          CODEX_BASE_URL: ${{ secrets.CODEX_BASE_URL }}
+          CODEX_MODEL: ${{ secrets.CODEX_MODEL }}
+        run: |
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+
+          def q(value: str) -> str:
+              return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+          home = Path(os.environ["CODEX_HOME"])
+          home.mkdir(parents=True, exist_ok=True)
+          (home / "config.toml").write_text("\n".join([
+              f"model = {q(os.environ['CODEX_MODEL'])}",
+              'model_provider = "gha-provider"',
+              "",
+              "[model_providers.gha-provider]",
+              'name = "GitHub Actions configured provider"',
+              f"base_url = {q(os.environ['CODEX_BASE_URL'].rstrip('/'))}",
+              'env_key = "CODEX_SECRET_KEY"',
+              "",
+          ]))
+          PY
+
+      - name: Run Codex
+        working-directory: worktree
+        env:
+          CODEX_HOME: ${{ runner.temp }}/codex-home
+          CODEX_SECRET_KEY: ${{ secrets.CODEX_SECRET_KEY }}
+        run: |
+          codex exec \
+            --sandbox workspace-write \
+            --ask-for-approval never \
+            --output-last-message ../context/codex-summary.md \
+            - < ../context/codex-task.md
+
+      - name: Verify worktree
+        working-directory: worktree
+        run: |
+          if [ -n "$(git ls-files -u)" ]; then
+            echo "Unresolved merge conflicts remain:"
+            git ls-files -u
+            exit 1
+          fi
+          git diff --check
+
+      - name: Commit changes
+        id: commit
+        working-directory: worktree
+        env:
+          COMMAND: ${{ steps.command.outputs.name }}
+          TARGET_BRANCH: ${{ steps.meta.outputs.target_branch }}
+        run: |
+          git add -A
+          if ! git diff --cached --quiet; then
+            git commit -m "Run Codex agent for ${COMMAND} (#${{ github.event.issue.number }})"
+          fi
+
+          if [ "$COMMAND" = "codex-resolve" ]; then
+            if [ "$(git rev-list --count "origin/${TARGET_BRANCH}..HEAD")" -gt 0 ]; then
+              echo "has_changes=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "has_changes=false" >> "$GITHUB_OUTPUT"
+            fi
+            exit 0
+          fi
+
+          if git diff --quiet HEAD "origin/${{ steps.pr_branch.outputs.name }}"; then
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "has_changes=true" >> "$GITHUB_OUTPUT"
+
+      - name: Push branch
+        if: steps.commit.outputs.has_changes == 'true'
+        working-directory: worktree
+        env:
+          COMMAND: ${{ steps.command.outputs.name }}
+        run: |
+          if [ "$COMMAND" = "codex-resolve" ]; then
+            branch="${{ steps.branch_resolve.outputs.name }}"
+          else
+            branch="${{ steps.pr_branch.outputs.name }}"
+          fi
+          git push origin "$branch"
+
+      - name: Create PR for resolve
+        if: steps.command.outputs.name == 'codex-resolve' && steps.commit.outputs.has_changes == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cat > pr-body.md <<EOF
+          Codex resolved upstream sync conflicts.
+
+          Issue: #${{ github.event.issue.number }}
+          Upstream: ${{ steps.meta.outputs.upstream_repo }}:${{ steps.meta.outputs.upstream_branch }}
+          Target branch: ${{ steps.meta.outputs.target_branch }}
+          Branch: ${{ steps.branch_resolve.outputs.name }}
+
+          Codex attempt summary:
+          \`\`\`
+          $(cat context/codex-summary.md 2>/dev/null || true)
+          \`\`\`
+
+          Review before merging. This workflow does not auto-merge.
+          EOF
+
+          pr_url="$(gh pr create \
+            --base "${{ steps.meta.outputs.target_branch }}" \
+            --head "${{ steps.branch_resolve.outputs.name }}" \
+            --title "Resolve upstream sync conflict #${{ github.event.issue.number }}" \
+            --label upstream-sync \
+            --label agent:needs-review \
+            --body-file pr-body.md)"
+          echo "$pr_url" > context/pr-url.txt
+
+      - name: Update labels and comment
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          COMMAND: ${{ steps.command.outputs.name }}
+          COMMIT_HAS_CHANGES: ${{ steps.commit.outputs.has_changes }}
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          gh label create agent:needs-review --color 0e8a16 --description "Agent output needs human review" || true
+          gh label create agent:needs-followup --color fbca04 --description "Agent needs another follow-up run" || true
+          gh label create agent:blocked --color b60205 --description "Agent is blocked and needs human input" || true
+
+          if [ "$JOB_STATUS" = "success" ]; then
+            gh issue edit "$ISSUE_NUMBER" --remove-label agent:blocked --remove-label agent:needs-followup 2>/dev/null || true
+            gh issue edit "$ISSUE_NUMBER" --add-label agent:needs-review
+            state="needs review"
+          else
+            gh issue edit "$ISSUE_NUMBER" --remove-label agent:needs-review 2>/dev/null || true
+            gh issue edit "$ISSUE_NUMBER" --add-label agent:needs-followup
+            state="needs follow-up"
+          fi
+
+          pr_url=""
+          if [ -f context/pr-url.txt ]; then
+            pr_url="$(cat context/pr-url.txt)"
+          elif [ -f context/pr.json ]; then
+            pr_url="$(jq -r '.url // empty' context/pr.json)"
+          fi
+
+          cat > comment.md <<EOF
+          Codex attempt summary
+
+          Command: \`${COMMAND}\`
+          Status: ${state}
+          Changed files committed: ${COMMIT_HAS_CHANGES:-unknown}
+          PR: ${pr_url:-not created}
+
+          \`\`\`
+          $(cat context/codex-summary.md 2>/dev/null || true)
+          \`\`\`
+          EOF
+
+          gh issue comment "$ISSUE_NUMBER" --body-file comment.md

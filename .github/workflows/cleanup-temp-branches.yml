@@ -1,0 +1,70 @@
+name: Cleanup temporary branches
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "43 20 * * *"
+
+permissions:
+  contents: write
+  pull-requests: read
+
+concurrency:
+  group: cleanup-temp-branches-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Delete closed PR temporary branches
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          gh pr list \
+            --state closed \
+            --limit 200 \
+            --json number,headRefName,headRepositoryOwner,headRepository,isCrossRepository,url \
+            > closed-prs.json
+
+          python3 - <<'PY' > branches-to-delete.txt
+          import json
+
+          repo_owner, repo_name = "${{ github.repository }}".split("/", 1)
+          prefixes = ("bot/sync-upstream-", "codex/resolve-upstream-conflict-")
+
+          with open("closed-prs.json", "r", encoding="utf-8") as f:
+              prs = json.load(f)
+
+          seen = set()
+          for pr in prs:
+              branch = pr.get("headRefName") or ""
+              if not branch.startswith(prefixes):
+                  continue
+              if pr.get("isCrossRepository"):
+                  continue
+              owner = ((pr.get("headRepositoryOwner") or {}).get("login") or "")
+              repo = ((pr.get("headRepository") or {}).get("name") or "")
+              if owner.lower() != repo_owner.lower() or repo.lower() != repo_name.lower():
+                  continue
+              if branch in {"main", "master", "immich-import", "custom-features"}:
+                  continue
+              if branch not in seen:
+                  seen.add(branch)
+                  print(branch)
+          PY
+
+          if [ ! -s branches-to-delete.txt ]; then
+            echo "No temporary branches to delete."
+            exit 0
+          fi
+
+          while IFS= read -r branch; do
+            echo "Deleting temporary branch: $branch"
+            gh api \
+              --method DELETE \
+              "repos/${REPO}/git/refs/heads/${branch}" \
+              || true
+          done < branches-to-delete.txt

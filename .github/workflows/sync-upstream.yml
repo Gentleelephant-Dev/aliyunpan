@@ -1,0 +1,180 @@
+name: Sync upstream
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 19 * * *"
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+concurrency:
+  group: upstream-sync-${{ github.repository }}
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: tickstep/aliyunpan
+  UPSTREAM_BRANCH: main
+  TARGET_BRANCH: immich-import
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout target branch
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ env.TARGET_BRANCH }}
+          fetch-depth: 0
+          token: ${{ secrets.UPSTREAM_SYNC_TOKEN || github.token }}
+
+      - name: Configure git
+        run: |
+          git config user.name "upstream-sync-bot"
+          git config user.email "upstream-sync-bot@users.noreply.github.com"
+
+      - name: Ensure labels
+        env:
+          GH_TOKEN: ${{ secrets.UPSTREAM_SYNC_TOKEN || github.token }}
+        run: |
+          gh label create upstream-sync --color 0366d6 --description "Upstream synchronization" || true
+          gh label create agent:merge-conflict --color d73a4a --description "Needs agent conflict resolution" || true
+          gh label create agent:needs-review --color 0e8a16 --description "Agent output needs human review" || true
+          gh label create agent:needs-followup --color fbca04 --description "Agent needs another follow-up run" || true
+          gh label create agent:blocked --color b60205 --description "Agent is blocked and needs human input" || true
+
+      - name: Fetch branches
+        run: |
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git" || true
+          git fetch upstream "${UPSTREAM_BRANCH}"
+          git fetch origin "${TARGET_BRANCH}"
+
+      - name: Check for existing open sync PR
+        id: existing
+        env:
+          GH_TOKEN: ${{ secrets.UPSTREAM_SYNC_TOKEN || github.token }}
+        run: |
+          existing="$(gh pr list \
+            --state open \
+            --label upstream-sync \
+            --base "${TARGET_BRANCH}" \
+            --json number,url \
+            --jq '.[0].url // empty')"
+          echo "url=$existing" >> "$GITHUB_OUTPUT"
+          if [ -n "$existing" ]; then
+            echo "Existing upstream sync PR: $existing" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Try merge upstream
+        if: steps.existing.outputs.url == ''
+        id: merge
+        shell: bash
+        run: |
+          upstream_sha="$(git rev-parse "upstream/${UPSTREAM_BRANCH}")"
+          upstream_short="$(git rev-parse --short=12 "upstream/${UPSTREAM_BRANCH}")"
+          sync_branch="bot/sync-upstream-${upstream_short}-${GITHUB_RUN_ID}"
+
+          {
+            echo "upstream_sha=$upstream_sha"
+            echo "upstream_short=$upstream_short"
+            echo "sync_branch=$sync_branch"
+          } >> "$GITHUB_OUTPUT"
+
+          git checkout -B "$sync_branch" "origin/${TARGET_BRANCH}"
+
+          set +e
+          git merge --no-ff --no-edit "upstream/${UPSTREAM_BRANCH}"
+          status=$?
+          set -e
+
+          if [ "$status" -eq 0 ]; then
+            echo "conflict=false" >> "$GITHUB_OUTPUT"
+            if git diff --quiet "origin/${TARGET_BRANCH}" HEAD; then
+              echo "changed=false" >> "$GITHUB_OUTPUT"
+            else
+              echo "changed=true" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "conflict=true" >> "$GITHUB_OUTPUT"
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            git diff --name-only --diff-filter=U > conflict-files.txt
+          fi
+
+      - name: Push sync branch
+        if: steps.existing.outputs.url == '' && steps.merge.outputs.conflict == 'false' && steps.merge.outputs.changed == 'true'
+        run: |
+          git push origin "${{ steps.merge.outputs.sync_branch }}"
+
+      - name: Create sync PR
+        if: steps.existing.outputs.url == '' && steps.merge.outputs.conflict == 'false' && steps.merge.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.UPSTREAM_SYNC_TOKEN || github.token }}
+        run: |
+          cat > pr-body.md <<EOF
+          Automated upstream sync.
+
+          upstream_repo: ${UPSTREAM_REPO}
+          upstream_branch: ${UPSTREAM_BRANCH}
+          target_branch: ${TARGET_BRANCH}
+          upstream_sha: ${{ steps.merge.outputs.upstream_sha }}
+
+          Temporary branch: ${{ steps.merge.outputs.sync_branch }}
+
+          Review and merge after CI passes. This workflow does not auto-merge.
+          EOF
+
+          gh pr create \
+            --base "${TARGET_BRANCH}" \
+            --head "${{ steps.merge.outputs.sync_branch }}" \
+            --title "Sync upstream ${UPSTREAM_REPO}:${UPSTREAM_BRANCH}" \
+            --label upstream-sync \
+            --body-file pr-body.md
+
+      - name: Create conflict issue
+        if: steps.existing.outputs.url == '' && steps.merge.outputs.conflict == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.UPSTREAM_SYNC_TOKEN || github.token }}
+        run: |
+          title="Upstream sync conflict: ${UPSTREAM_REPO}:${UPSTREAM_BRANCH} -> ${TARGET_BRANCH}"
+          existing="$(gh issue list \
+            --state open \
+            --label upstream-sync \
+            --json number,title \
+            --jq ".[] | select(.title == \"$title\") | .number" \
+            | head -n 1)"
+
+          if [ -n "$existing" ]; then
+            echo "Conflict issue already exists: #$existing" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          files="$(cat conflict-files.txt)"
+
+          cat > issue-body.md <<EOF
+          Automated upstream sync found merge conflicts.
+
+          upstream_repo: ${UPSTREAM_REPO}
+          upstream_branch: ${UPSTREAM_BRANCH}
+          target_branch: ${TARGET_BRANCH}
+          upstream_sha: ${{ steps.merge.outputs.upstream_sha }}
+
+          Conflicted files:
+          \`\`\`
+          ${files}
+          \`\`\`
+
+          Comment \`/codex-resolve\` to ask Codex to resolve this conflict and open a PR.
+          EOF
+
+          gh issue create \
+            --title "$title" \
+            --label "upstream-sync,agent:merge-conflict" \
+            --body-file issue-body.md
+
+      - name: No upstream changes
+        if: steps.existing.outputs.url == '' && steps.merge.outputs.conflict == 'false' && steps.merge.outputs.changed == 'false'
+        run: |
+          echo "Target branch already contains upstream ${UPSTREAM_REPO}:${UPSTREAM_BRANCH}." >> "$GITHUB_STEP_SUMMARY"
