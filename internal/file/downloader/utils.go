@@ -15,8 +15,6 @@ package downloader
 
 import (
 	"errors"
-	"github.com/tickstep/library-go/logger"
-	"github.com/tickstep/library-go/requester"
 	mathrand "math/rand"
 	"mime"
 	"net/url"
@@ -24,6 +22,10 @@ import (
 	"regexp"
 	"strconv"
 	"time"
+
+	"github.com/tickstep/aliyunpan/internal/utils"
+	"github.com/tickstep/library-go/logger"
+	"github.com/tickstep/library-go/requester"
 )
 
 var (
@@ -102,15 +104,15 @@ func fixCacheSize(size *int) {
 
 // IsUrlExpired 下载链接是否已过期。过期返回True
 func IsUrlExpired(urlStr string) bool {
-	u, err := url.Parse(urlStr)
+	expiredTimeSec, err := utils.GetExpiredTimeSecFromOSSUrl(urlStr)
 	if err != nil {
+		// 解析错误，默认过期
 		return true
 	}
-	expiredTimeSecStr := u.Query().Get("x-oss-expires")
-	expiredTimeSec, _ := strconv.ParseInt(expiredTimeSecStr, 10, 64)
 	if (expiredTimeSec - time.Now().Unix()) <= 5 { // 小于5秒钟
 		// expired
 		return true
 	}
+	// 返回未过期
 	return false
 }
